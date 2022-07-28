@@ -4,15 +4,19 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"math"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
+
+var intHeader = []byte{0x0e, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x18, 0x00}
+
+//var intHeaders [3][14]byte
 
 func main() {
 	const RMOTION_PATH = "/tmp/rmotion"
@@ -60,7 +64,6 @@ type TupleBuf struct {
 	length int
 }
 
-var intHeader = []byte{0x0e, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x18, 0x00}
 var eos = []byte{0x00, 0x00, 0x04, 0x00}
 
 const EOS = 0xffffffff
@@ -77,18 +80,18 @@ func NewTupleBuf() *TupleBuf {
 
 var count = 0
 
-func (tb *TupleBuf) Append(v int) bool {
+func (tb *TupleBuf) Append(v int, idx int) bool {
+	//intHeader := intHeaders[idx]
 	if tb.pos+len(intHeader)+4 > tb.length {
 		binary.LittleEndian.PutUint32(tb.buf[0:4], uint32(tb.pos))
 		return true
 	}
 
-	copy(tb.buf[tb.pos:], intHeader)
+	copy(tb.buf[tb.pos:], intHeader[0:14])
 	tb.pos += len(intHeader)
 	binary.LittleEndian.PutUint32(tb.buf[tb.pos:tb.pos+4], uint32(v))
 	tb.pos += 4
 	count++
-	log.Printf(fmt.Sprintf("%d", count))
 	return false
 }
 
@@ -104,9 +107,13 @@ func (tb *TupleBuf) AppendEos() bool {
 	return false
 }
 
-func createReceiverChannel(context context.Context, addr string) (net.Conn, chan<- int, error) {
+func (tb *TupleBuf) Clear() {
+	tb.pos = 4
+}
+
+func createReceiverChannel(context context.Context, addr string, idx int) (net.Conn, chan<- int, error) {
 	conn, err := net.Dial("tcp", addr)
-	reader := make(chan int)
+	reader := make(chan int, 1000)
 
 	go func() {
 		defer func(conn net.Conn) {
@@ -126,6 +133,7 @@ func createReceiverChannel(context context.Context, addr string) (net.Conn, chan
 						if err != nil {
 							log.Printf(err.Error())
 						}
+						tb.Clear()
 						tb.AppendEos()
 					}
 					_, err = conn.Write(tb.buf[:tb.pos])
@@ -133,14 +141,15 @@ func createReceiverChannel(context context.Context, addr string) (net.Conn, chan
 						log.Printf(err.Error())
 					}
 					break out
-				} else if tb.Append(v) {
+				} else if tb.Append(v, idx) {
 					// buffer full,send it
 					_, err = conn.Write(tb.buf[:tb.pos])
 					if err != nil {
 						log.Printf(err.Error())
 					}
+					tb.Clear()
 					// Append again
-					tb.Append(v)
+					tb.Append(v, idx)
 				}
 			case <-context.Done():
 				break out
@@ -203,42 +212,37 @@ func countPrimeNumbers(num1, num2 int) int {
 	return count
 }
 
-var countb = 0
-
-func createCalculateChannel(ctx context.Context, revCh chan<- int) chan<- []byte {
-	calcCh := make(chan []byte)
-	go func() {
-		defer close(calcCh)
-
-		for {
-			select {
-			case buf := <-calcCh:
-				pos := 4
-				for {
-					if pos == len(buf) {
-						break
-					}
-					if pos+18 > len(buf) {
-						revCh <- EOS
-						break
-					}
-					countb++
-					orgNum := int(binary.LittleEndian.Uint32((buf)[pos+14 : pos+18]))
-					//newNum := countPrimeNumbers(0, orgNum)
-					newNum := orgNum
-					pos += 18
-					log.Printf("countb %d %d", countb, newNum)
-					revCh <- newNum
-				}
-			case <-ctx.Done():
-				break
-			}
+func doCalcuation(ctx context.Context, buf []byte, revCh chan<- int) {
+	var wg sync.WaitGroup
+	pos := 4
+	for {
+		if pos == len(buf) {
+			break
 		}
-	}()
-	return calcCh
+		if pos+18 > len(buf) {
+			log.Printf("EOS")
+			wg.Wait()
+			revCh <- EOS
+			break
+		}
+
+		orgNum := int(binary.LittleEndian.Uint32((buf)[pos+14 : pos+18]))
+		wg.Add(1)
+		pos += 18
+		go func() {
+			newNum := countPrimeNumbers(0, orgNum)
+			//newNum := orgNum
+			revCh <- newNum
+			wg.Done()
+		}()
+	}
 }
 
+var segCount = 0
+
 func handleIncomingRequest(conn net.Conn) {
+	idx := segCount
+	segCount++
 	ctx, _ := context.WithCancel(context.Background())
 
 	header, err := readRMotionHeader(conn)
@@ -246,13 +250,12 @@ func handleIncomingRequest(conn net.Conn) {
 		log.Fatal(err)
 	}
 
-	revConn, receiverChan, err := createReceiverChannel(ctx, header)
+	revConn, receiverChan, err := createReceiverChannel(ctx, header, idx)
 	err = forwardRegisterMessage(conn, revConn)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	calCh := createCalculateChannel(ctx, receiverChan)
 outer:
 	for {
 		sizeHeader := make([]byte, 4)
@@ -291,7 +294,8 @@ outer:
 			}
 			break
 		}
-		calCh <- bodyBuf
+		//copy(intHeaders[idx][0:14], bodyBuf[4:4+14])
+		doCalcuation(ctx, bodyBuf, receiverChan)
 	}
 
 	// close conn
